@@ -1,0 +1,36 @@
+Bootstrap: docker
+From: python:3.11-slim
+
+%files
+    requirements.txt /app/requirements.txt
+    src/* /app/
+
+%post
+    # Install system dependencies
+    apt-get update && apt-get install -y \
+        curl \
+        build-essential \
+        && rm -rf /var/lib/apt/lists/*
+
+    # Install uv using pip
+    pip install uv
+
+    # Add uv to PATH
+    export PATH="/root/.local/bin:$PATH"
+
+    # Install Python dependencies using uv
+    cd /app
+    uv venv
+    uv pip install -r requirements.txt
+
+%environment
+    export LC_ALL=C
+    export PYTHONPATH=/app:$PYTHONPATH
+    export PATH="/root/.local/bin:$PATH"
+
+%runscript
+    cd /app && . .venv/bin/activate && exec python main.py "$@"
+
+%labels
+    Author Max Feng
+    Version v1.0 
