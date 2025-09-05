@@ -133,3 +133,13 @@ Run command to submit SLURM jobs:
 - ```make run_transcript_tariffs``` 
 
 Once it's allocated and assigned a job id, run command ```tail -f $gcap_data/ai1/logs/ai1-$jobid.err``` to monitor the progress.
+
+
+## 6. Run LLM as API Service
+
+### Start the vllm api server
+```
+make run_vllm_api
+```
+
+Follow the Jupyter notebook vllmapi_transcript_analysis.ipynb to call LLM as API.
