@@ -13,10 +13,10 @@
 ## 2. Open Source LLMs
 
 #### Meta Models
-- **Llama 3.3 70B** (7B, 13B, 70B): /oak/stanford/groups/maggiori/GCAP/data/llm_models/llama3_3_hf/Llama-3.3-70B-Instruct-AWQ
+- **Llama 3.3 70B** : /oak/stanford/groups/maggiori/GCAP/data/llm_models/llama3_3_hf/Llama-3.3-70B-Instruct-AWQ
 
 #### Google Models
-- **gemma3 27B** (2.7B): /oak/stanford/groups/maggiori/GCAP/data/llm_models/gemma3/gemma-3-27b-it
+- **gemma3 27B** : /oak/stanford/groups/maggiori/GCAP/data/llm_models/gemma3/gemma-3-27b-it
 
 #### OpenAI Models
 - **GPT OSS 120B**: /oak/stanford/groups/maggiori/GCAP/data/llm_models/openai/gpt-oss-120b
@@ -30,6 +30,7 @@
 
 ### Download models from HuggingFace
 ```bash
+source activate gpu1
 cd $gcap_data/llm_models/qwen3
 mkdir -p Qwen3-30B-A3B
 huggingface-cli download Qwen/Qwen3-30B-A3B --local-dir ./Qwen3-30B-A3B
