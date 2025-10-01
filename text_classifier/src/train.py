@@ -16,6 +16,7 @@ Apple Silicon (MPS) does not support PyTorch distributed training.
 import os
 import logging
 import random
+from datetime import timedelta
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -79,18 +80,71 @@ def setup_distributed() -> tuple[int, int]:
         Tuple of (rank, world_size)
     """
     if not torch.distributed.is_initialized():
-        torch.distributed.init_process_group(backend='nccl')
+        # Determine the best backend for distributed training
+        backend = 'nccl' if torch.cuda.is_available() else 'gloo'
+
+        # Use gloo as fallback for networking issues
+        if torch.cuda.is_available():
+            try:
+                # Try NCCL first for CUDA
+                torch.distributed.init_process_group(
+                    backend='nccl',
+                    timeout=timedelta(seconds=1800)  # 30 minutes timeout
+                )
+                logging.info("Distributed process group initialized with NCCL backend")
+            except Exception as nccl_error:
+                logging.warning(f"NCCL initialization failed: {nccl_error}")
+                logging.info("Falling back to Gloo backend for CUDA training")
+                try:
+                    torch.distributed.init_process_group(
+                        backend='gloo',
+                        timeout=timedelta(seconds=1800)
+                    )
+                    logging.info("Distributed process group initialized with Gloo backend")
+                except Exception as gloo_error:
+                    logging.error(f"Both NCCL and Gloo initialization failed: {gloo_error}")
+                    raise
+        else:
+            # CPU-only training uses Gloo
+            try:
+                torch.distributed.init_process_group(
+                    backend='gloo',
+                    timeout=timedelta(seconds=1800)
+                )
+                logging.info("Distributed process group initialized with Gloo backend (CPU)")
+            except Exception as e:
+                logging.error(f"Failed to initialize distributed process group: {e}")
+                raise
 
     rank = torch.distributed.get_rank()
     world_size = torch.distributed.get_world_size()
+
+    # Set CUDA device for this process
+    if torch.cuda.is_available():
+        torch.cuda.set_device(rank % torch.cuda.device_count())
+        logging.info(f"Process {rank} using CUDA device {torch.cuda.current_device()}")
 
     return rank, world_size
 
 
 def cleanup_distributed() -> None:
-    """Cleanup distributed training."""
+    """Cleanup distributed training with timeout and error handling."""
     if torch.distributed.is_initialized():
-        torch.distributed.destroy_process_group()
+        try:
+            # Wait a bit for any ongoing operations to complete
+            import time
+            time.sleep(1)
+
+            # Destroy the process group with timeout handling
+            torch.distributed.destroy_process_group()
+            logging.info("Distributed process group destroyed successfully")
+        except Exception as e:
+            logging.warning(f"Error during process group cleanup: {e}")
+            # Force cleanup by setting the backend to None if possible
+            try:
+                torch.distributed._C._destroy_process_group()
+            except:
+                pass
 
 
 def is_main_process(rank: int = 0) -> bool:
@@ -154,10 +208,10 @@ def auto_detect_gpus(config: Config) -> Config:
     if torch.cuda.device_count() > 1 and not config.force_single_gpu:
         # Multi-GPU CUDA training
         config.distributed = True
-        config.world_size = torch.cuda.device_count()
-        config.rank = int(os.environ.get('RANK', 0))
+        # Don't set rank/world_size here - will be set after distributed init
+        config.rank = 0  # Temporary default
         config.local_rank = int(os.environ.get('LOCAL_RANK', 0))
-        logging.info(f"Detected {config.world_size} CUDA GPUs - enabling distributed training")
+        logging.info(f"Detected {torch.cuda.device_count()} CUDA GPUs - enabling distributed training")
     else:
         # Single device training (single GPU, MPS, or CPU)
         config.distributed = False
@@ -386,6 +440,7 @@ def train_epoch(
     device: str,
     criterion: nn.Module,
     config: Config,
+    epoch: int = 0,
     metrics: Optional[DistributedMetrics] = None
 ) -> Tuple[float, float]:
     """
@@ -409,9 +464,12 @@ def train_epoch(
         metrics = DistributedMetrics(config.world_size)
     metrics.reset()
 
-    # Set sampler epoch for distributed training
+    # Set sampler epoch for distributed training (ensures different shuffling each epoch)
     if hasattr(data_loader.sampler, 'set_epoch'):
-        data_loader.sampler.set_epoch(config.rank)
+        data_loader.sampler.set_epoch(epoch)
+
+    # Synchronize processes before starting training (only if needed)
+    # Removed barrier here as it's not necessary for training start
 
     pbar = tqdm(
         data_loader,
@@ -420,40 +478,54 @@ def train_epoch(
     )
 
     for batch_idx, batch in enumerate(pbar):
-        # Move batch to device
-        input_ids = batch['input_ids'].to(device, non_blocking=True)
-        attention_mask = batch['attention_mask'].to(device, non_blocking=True)
-        labels = batch['label'].to(device, non_blocking=True)
+        try:
+            # Move batch to device
+            input_ids = batch['input_ids'].to(device, non_blocking=True)
+            attention_mask = batch['attention_mask'].to(device, non_blocking=True)
+            labels = batch['label'].to(device, non_blocking=True)
 
-        # Zero gradients
-        optimizer.zero_grad()
+            # Zero gradients
+            optimizer.zero_grad()
 
-        # Forward pass
-        outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+            # Forward pass with autocast for better memory efficiency
+            with torch.amp.autocast(device_type='cuda' if 'cuda' in device else 'cpu'):
+                outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+                loss = criterion(outputs, labels)
 
-        # Compute loss
-        loss = criterion(outputs, labels)
+            # Backward pass
+            loss.backward()
 
-        # Backward pass
-        loss.backward()
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(),
+                max_norm=config.max_grad_norm
+            )
 
-        # Gradient clipping
-        torch.nn.utils.clip_grad_norm_(
-            model.parameters(),
-            max_norm=config.max_grad_norm
-        )
+            # Update weights
+            optimizer.step()
+            scheduler.step()
 
-        # Update weights
-        optimizer.step()
-        scheduler.step()
+            # Update metrics (convert outputs to float32 for metrics)
+            with torch.no_grad():
+                metrics.update(loss, outputs.float(), labels)
 
-        # Update metrics
-        metrics.update(loss, outputs, labels)
+            # Log progress
+            if is_main_process(config.rank) and \
+               (batch_idx + 1) % config.log_interval == 0:
+                pbar.set_postfix({'loss': f'{loss.item():.4f}'})
 
-        # Log progress
-        if is_main_process(config.rank) and \
-           (batch_idx + 1) % config.log_interval == 0:
-            pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+            # Clear cache periodically to prevent memory buildup
+            if (batch_idx + 1) % 50 == 0:
+                torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
+        except RuntimeError as e:
+            if "out of memory" in str(e):
+                if is_main_process(config.rank):
+                    logging.error(f"GPU out of memory at batch {batch_idx}. Try reducing batch size.")
+                torch.cuda.empty_cache() if torch.cuda.is_available() else None
+                raise
+            else:
+                raise
 
     return metrics.compute_average()
 
@@ -485,6 +557,9 @@ def evaluate(
         metrics = DistributedMetrics(config.world_size)
     metrics.reset()
 
+    # Synchronize processes before evaluation (only if needed)
+    # Removed barrier here as evaluation doesn't require initial sync
+
     all_predictions = []
     all_labels = []
 
@@ -495,24 +570,29 @@ def evaluate(
     )
 
     with torch.no_grad():
-        for batch in pbar:
+        for batch_idx, batch in enumerate(pbar):
             # Move batch to device
             input_ids = batch['input_ids'].to(device, non_blocking=True)
             attention_mask = batch['attention_mask'].to(device, non_blocking=True)
             labels = batch['label'].to(device, non_blocking=True)
 
-            # Forward pass
-            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-            loss = criterion(outputs, labels)
+            # Forward pass with autocast for consistency
+            with torch.amp.autocast(device_type='cuda' if 'cuda' in device else 'cpu'):
+                outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+                loss = criterion(outputs, labels)
 
             # Update metrics
-            metrics.update(loss, outputs, labels)
+            metrics.update(loss, outputs.float(), labels)
 
             # Store predictions and labels for detailed metrics (only on main process)
             if is_main_process(config.rank):
                 pred_classes = torch.argmax(outputs, dim=1)
                 all_predictions.extend(pred_classes.cpu().numpy())
                 all_labels.extend(labels.cpu().numpy())
+
+            # Clear cache periodically during evaluation too
+            if (batch_idx + 1) % 100 == 0:
+                torch.cuda.empty_cache() if torch.cuda.is_available() else None
 
     avg_loss, accuracy = metrics.compute_average()
 
@@ -534,8 +614,30 @@ def train_model() -> None:
     Handles configuration, data loading, model initialization,
     training loop, validation, and checkpointing.
     """
+    # Set environment variables to reduce networking warnings and improve stability
+    os.environ.setdefault('NCCL_SOCKET_IFNAME', '^docker0,lo')
+    os.environ.setdefault('NCCL_IB_DISABLE', '1')  # Disable InfiniBand if not available
+    os.environ.setdefault('NCCL_P2P_DISABLE', '1')  # Disable P2P for single-node
+    os.environ.setdefault('GLOO_SOCKET_IFNAME', 'eth0,enp0s3,lo')  # Gloo interface preference
+    os.environ.setdefault('NCCL_TIMEOUT', '1800')  # 30 minutes timeout
+
+    # Force specific network interface for containerized environments
+    if 'APPTAINER_CONTAINER' in os.environ or 'SINGULARITY_CONTAINER' in os.environ:
+        os.environ.setdefault('GLOO_SOCKET_IFNAME', 'lo')  # Use loopback in container
+        os.environ.setdefault('NCCL_SOCKET_IFNAME', 'lo')  # Use loopback for NCCL too
+
     # Initialize configuration
     config = Config()
+
+    # Override epochs from environment variable if provided
+    if 'TRAIN_EPOCHS' in os.environ:
+        try:
+            epochs_override = int(os.environ['TRAIN_EPOCHS'])
+            if epochs_override > 0:
+                config.num_epochs = epochs_override
+                logging.info(f"Overriding epochs from environment: {epochs_override}")
+        except ValueError:
+            logging.warning(f"Invalid TRAIN_EPOCHS value: {os.environ['TRAIN_EPOCHS']}, using default")
 
     # Auto-detect and configure GPUs
     config = auto_detect_gpus(config)
@@ -724,7 +826,7 @@ def train_model() -> None:
             # Training phase
             train_loss, train_accuracy = train_epoch(
                 model, train_loader, optimizer, scheduler,
-                config.device, criterion, config,
+                config.device, criterion, config, epoch,
                 metrics=train_metrics
             )
 
@@ -748,28 +850,51 @@ def train_model() -> None:
                 logging.info(f"{'F1 Score':<20} {'-':<15} {val_f1:<15.4f}")
                 logging.info("-" * 70)
 
+            # Synchronize before checkpoint saving
+            if config.distributed and torch.distributed.is_initialized():
+                try:
+                    torch.distributed.barrier()
+                    if is_main_process(config.rank):
+                        logging.info("Pre-checkpoint synchronization successful")
+                except Exception as e:
+                    if is_main_process(config.rank):
+                        logging.warning(f"Pre-checkpoint barrier failed: {e}, continuing anyway")
+
             # Save best model (only on main process)
             if val_accuracy > best_accuracy and is_main_process(config.rank):
                 best_accuracy = val_accuracy
                 checkpoint_path = Path(config.save_dir) / 'best_model.pt'
 
-                # Extract model state dict (handle DDP wrapper)
-                model_state_dict = (
-                    model.module.state_dict() if hasattr(model, 'module')
-                    else model.state_dict()
-                )
+                try:
+                    # Extract model state dict (handle DDP wrapper)
+                    model_state_dict = (
+                        model.module.state_dict() if hasattr(model, 'module')
+                        else model.state_dict()
+                    )
 
-                # Save checkpoint
-                torch.save({
-                    'epoch': epoch,
-                    'model_state_dict': model_state_dict,
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'best_accuracy': best_accuracy,
-                    'model_config': config,
-                }, checkpoint_path)
+                    # Save checkpoint with error handling
+                    torch.save({
+                        'epoch': epoch,
+                        'model_state_dict': model_state_dict,
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'best_accuracy': best_accuracy,
+                        'model_config': config,
+                    }, checkpoint_path)
 
-                logging.info("")
-                logging.info(f"✓ New best model saved (accuracy: {best_accuracy:.4f})")
+                    logging.info("")
+                    logging.info(f"✓ New best model saved (accuracy: {best_accuracy:.4f})")
+                except Exception as e:
+                    logging.error(f"Failed to save checkpoint: {e}")
+
+            # Ensure all processes wait for main process to finish saving
+            if config.distributed and torch.distributed.is_initialized():
+                try:
+                    torch.distributed.barrier()
+                    if is_main_process(config.rank):
+                        logging.info("Post-checkpoint synchronization successful")
+                except Exception as e:
+                    if is_main_process(config.rank):
+                        logging.warning(f"Post-checkpoint barrier failed: {e}, continuing anyway")
 
         if is_main_process(config.rank):
             logging.info("")
@@ -782,15 +907,38 @@ def train_model() -> None:
         if is_main_process(config.rank):
             logging.warning("")
             logging.warning("Training interrupted by user")
+        # Graceful cleanup on interrupt
+        if config.distributed and torch.distributed.is_initialized():
+            try:
+                torch.distributed.barrier()
+            except:
+                pass  # Ignore barrier failures during cleanup
+    except RuntimeError as e:
+        if "barrier" in str(e).lower() or "gloo" in str(e).lower():
+            if is_main_process(config.rank):
+                logging.error("")
+                logging.error(f"Distributed training synchronization error: {e}")
+                logging.error("This may be due to process communication issues")
+        else:
+            if is_main_process(config.rank):
+                logging.error("")
+                logging.error(f"Runtime error during training: {e}", exc_info=True)
+        # Don't re-raise distributed errors to allow graceful cleanup
     except Exception as e:
         if is_main_process(config.rank):
             logging.error("")
             logging.error(f"Training failed with error: {e}", exc_info=True)
         raise
     finally:
-        # Cleanup distributed training
+        # Cleanup distributed training with timeout and error handling
         if config.distributed:
-            cleanup_distributed()
+            try:
+                cleanup_distributed()
+                if is_main_process(config.rank):
+                    logging.info("Distributed training cleanup completed")
+            except Exception as cleanup_error:
+                if is_main_process(config.rank):
+                    logging.warning(f"Cleanup warning: {cleanup_error}")
 
 
 if __name__ == "__main__":

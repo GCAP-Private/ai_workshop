@@ -1,45 +1,114 @@
 Bootstrap: docker
-From: python:3.9-slim
+From: pytorch/pytorch:2.6.0-cuda12.4-cudnn9-runtime
 
 %help
-    Text classifier based on BERT transformer using PyTorch
+    BERT-based text classifier with distributed training support
+
+    Features:
+    - Multi-GPU distributed training using torchrun
+    - BERT encoder with classification head
+    - Optimized for NVIDIA H100 GPUs
+    - Memory-efficient training with autocast
+    - Comprehensive logging and checkpointing
+
+    Usage:
+        # Run distributed training
+        apptainer run --nv container.sif
+
+        # Interactive shell
+        apptainer shell --nv container.sif
 
 %labels
-    Author Your Name
-    Version 1.0
+    Author Max Feng
+    Version 2.0
+    Description BERT text classifier with distributed training
+    CUDA_Version 12.4
+    PyTorch_Version 2.6.0
 
 %files
     pyproject.toml /app/pyproject.toml
-    src/ /app/src/
+    src/* /app/src/
     data/ /app/data/
     apptainer.env /app/.env
 
 %post
+    # Update and install system dependencies
     apt-get update && apt-get install -y \
         build-essential \
         curl \
-        software-properties-common
+        git \
+        htop \
+        tree \
+        && rm -rf /var/lib/apt/lists/*
 
-    # Install uv
+    # Install uv package manager
     pip install uv
 
+    # Set up application directory
     cd /app
-    uv pip install --system -e .
 
-    mkdir -p checkpoints
+    # Install Python dependencies
+    uv sync
+    uv pip install python-dotenv pyarrow
 
-    apt-get clean
-    rm -rf /var/lib/apt/lists/*
+    # Create necessary directories
+    mkdir -p checkpoints logs data
+
+    # Set proper permissions
+    chmod -R 755 /app
 
 %environment
+    # Python environment
     export PYTHONPATH=/app:$PYTHONPATH
-    export DEPLOYMENT_ENV=apptainer
+    export DEPLOYMENT_ENV=sherlock
+
+    # NCCL settings for optimized distributed training
+    export NCCL_SOCKET_IFNAME=lo
+    export NCCL_IB_DISABLE=1
+    export NCCL_P2P_DISABLE=1
+    export NCCL_TIMEOUT=1800
+
+    # Gloo settings for fallback distributed training
+    export GLOO_SOCKET_IFNAME=lo
+    export GLOO_DEVICE_TRANSPORT=TCP
+
+    # PyTorch settings
+    export CUDA_LAUNCH_BLOCKING=0
+
+    # Container identification
+    export APPTAINER_CONTAINER=1
+
+    # Memory optimization
+    export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
+
+    # Logging
+    export PYTHONUNBUFFERED=1
+    export TQDM_DISABLE=0
 
 %runscript
-    cd /app
-    python src/train.py
+    #!/bin/bash
+    set -e
 
-%test
+    echo "=== BERT Text Classifier - Distributed Training ==="
+    echo "Container: $(hostname)"
+    echo "Date: $(date)"
+    echo "GPUs: $(nvidia-smi -L | wc -l)"
+    echo "================================================="
+
     cd /app
-    python -c "import torch; print('PyTorch version:', torch.__version__)"
-    python -c "import transformers; print('Transformers version:', transformers.__version__)"
+    . .venv/bin/activate
+
+    # Verify GPU access
+    echo "Verifying GPU access..."
+    nvidia-smi --query-gpu=name,memory.total --format=csv,noheader,nounits
+
+    echo "Starting distributed training..."
+    exec torchrun \
+        --nproc_per_node=auto \
+        --standalone \
+        --nnodes=1 \
+        --rdzv_backend=c10d \
+        --rdzv_endpoint=127.0.0.1:0 \
+        --master_addr=127.0.0.1 \
+        src/train.py
+
