@@ -1,0 +1,27 @@
+2025-09-30 20:18:42,514 - INFO - Logging to logs/training_20250930_201842.log
+2025-09-30 20:18:42,514 - INFO - Using Apple Silicon GPU (MPS)
+2025-09-30 20:18:42,516 - INFO - ======================================================================
+2025-09-30 20:18:42,516 - INFO - Starting training with configuration:
+2025-09-30 20:18:42,516 - INFO -   Model: bert-base-uncased
+2025-09-30 20:18:42,516 - INFO -   Num classes: 8
+2025-09-30 20:18:42,516 - INFO -   Max length: 512
+2025-09-30 20:18:42,516 - INFO -   Batch size: 16
+2025-09-30 20:18:42,516 - INFO -   Learning rate: 2e-05
+2025-09-30 20:18:42,516 - INFO -   Epochs: 5
+2025-09-30 20:18:42,516 - INFO -   Device: mps
+2025-09-30 20:18:42,516 - INFO -   Distributed: False
+2025-09-30 20:18:42,516 - INFO - ======================================================================
+2025-09-30 20:18:42,686 - INFO - Loaded 45633 samples from data/train_data.parquet
+2025-09-30 20:18:43,135 - INFO - Loaded 9779 validation samples from data/val_data.parquet
+2025-09-30 20:18:43,136 - INFO - Using separate validation file
+2025-09-30 20:18:43,752 - INFO - Model parameters: 110,106,760 total, 624,520 trainable
+2025-09-30 20:18:43,752 - INFO - BERT encoder frozen - training classification head only
+2025-09-30 20:18:43,752 - INFO - Found existing checkpoint: checkpoints/best_model.pt
+2025-09-30 20:18:43,752 - INFO - Loading checkpoint from checkpoints/best_model.pt
+2025-09-30 20:18:43,898 - INFO - Resuming from epoch 5, best accuracy: 0.7942
+2025-09-30 20:18:43,898 - INFO - Successfully loaded checkpoint, resuming from epoch 5
+2025-09-30 20:18:43,898 - INFO - 
+2025-09-30 20:18:43,898 - INFO - ======================================================================
+2025-09-30 20:18:43,898 - INFO - Training completed successfully!
+2025-09-30 20:18:43,898 - INFO - Best validation accuracy: 0.7942
+2025-09-30 20:18:43,898 - INFO - ======================================================================
