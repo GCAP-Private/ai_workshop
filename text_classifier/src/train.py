@@ -166,10 +166,12 @@ class DistributedMetrics:
         self.total_samples = 0
 
     def update(self, loss: torch.Tensor, outputs: torch.Tensor, labels: torch.Tensor):
-        """Update metrics with batch results."""
+        """Update metrics with batch results for multi-label classification."""
         self.total_loss += loss.item() * labels.size(0)
-        predictions = torch.argmax(outputs, dim=1)
-        self.total_correct += (predictions == labels).sum().item()
+        # For multi-label: apply sigmoid and threshold at 0.5
+        predictions = (torch.sigmoid(outputs) > 0.5).float()
+        # Exact match accuracy: all labels must match
+        self.total_correct += (predictions == labels).all(dim=1).sum().item()
         self.total_samples += labels.size(0)
 
     def compute_average(self) -> Tuple[float, float]:
@@ -327,53 +329,25 @@ def load_data(config: Config) -> Tuple[List[str], np.ndarray]:
     # Extract texts and labels
     texts = df[config.text_column].astype(str).tolist()
 
-    # Handle labels - convert to int64, handling various formats
+    # Handle labels - already in one-hot encoded format (7-dimensional arrays)
     label_series = df[config.label_column]
 
-    # Check if labels are sequences (lists/arrays) and extract first element if needed
-    if isinstance(label_series.iloc[0], (list, np.ndarray)):
-        labels = np.array([int(label[0]) for label in label_series], dtype=np.int64)
-    else:
-        labels = label_series.astype(np.int64).to_numpy()
+    # Convert to numpy array - labels are already one-hot encoded
+    labels = np.array([np.array(label, dtype=np.float32) for label in label_series])
 
     logging.info(f"Loaded {len(texts)} samples from {data_path}")
+    logging.info(f"Label shape: {labels.shape}, dtype: {labels.dtype}")
     return texts, labels
 
 
-def load_validation_data(config: Config) -> Optional[Tuple[List[str], np.ndarray]]:
-    """
-    Load validation data from parquet file if available.
-
-    Args:
-        config: Config instance with file paths and column names
-
-    Returns:
-        Tuple of (texts, labels) where labels is a numpy array, or None if file doesn't exist
-    """
-    val_path = Path(config.val_file)
-
-    if not val_path.exists():
-        logging.info(f"Validation file {val_path} not found. Will use train/val split.")
-        return None
-
-    try:
-        df = pd.read_parquet(val_path)
-        texts = df[config.text_column].astype(str).tolist()
-
-        # Handle labels - convert to int64, handling various formats
-        label_series = df[config.label_column]
-
-        # Check if labels are sequences (lists/arrays) and extract first element if needed
-        if isinstance(label_series.iloc[0], (list, np.ndarray)):
-            labels = np.array([int(label[0]) for label in label_series], dtype=np.int64)
-        else:
-            labels = label_series.astype(np.int64).to_numpy()
-
-        logging.info(f"Loaded {len(texts)} validation samples from {val_path}")
-        return texts, labels
-    except Exception as e:
-        logging.warning(f"Failed to load validation data: {e}. Will use train/val split.")
-        return None
+# DEPRECATED: External validation file loading removed
+# Validation data is now always created by randomly splitting the training data
+# with the val_split ratio (default 20%). This ensures reproducible splits
+# and simplifies the data pipeline.
+#
+# def load_validation_data(config: Config) -> Optional[Tuple[List[str], np.ndarray]]:
+#     """Load validation data from parquet file if available."""
+#     ...
 
 
 def create_data_loader(
@@ -382,6 +356,7 @@ def create_data_loader(
     tokenizer: PreTrainedTokenizer,
     max_length: int,
     batch_size: int,
+    num_classes: int,
     shuffle: bool = True,
     distributed: bool = False
 ) -> DataLoader:
@@ -390,10 +365,11 @@ def create_data_loader(
 
     Args:
         texts: List of text strings
-        labels: Numpy array of integer labels
+        labels: Numpy array of label arrays (multi-label)
         tokenizer: HuggingFace tokenizer instance
         max_length: Maximum sequence length
         batch_size: Batch size for training
+        num_classes: Number of classes for multi-label classification
         shuffle: Whether to shuffle data
         distributed: Whether to use distributed sampler
 
@@ -402,7 +378,7 @@ def create_data_loader(
     """
     # Convert numpy array to list for dataset
     labels_list = labels.tolist()
-    dataset = TextClassificationDataset(texts, labels_list, tokenizer, max_length)
+    dataset = TextClassificationDataset(texts, labels_list, tokenizer, max_length, num_classes)
 
     # Use DistributedSampler for multi-GPU training
     if distributed:
@@ -586,7 +562,8 @@ def evaluate(
 
             # Store predictions and labels for detailed metrics (only on main process)
             if is_main_process(config.rank):
-                pred_classes = torch.argmax(outputs, dim=1)
+                # For multi-label: apply sigmoid and threshold
+                pred_classes = (torch.sigmoid(outputs) > 0.5).float()
                 all_predictions.extend(pred_classes.cpu().numpy())
                 all_labels.extend(labels.cpu().numpy())
 
@@ -598,8 +575,10 @@ def evaluate(
 
     # Calculate detailed metrics only on main process
     if is_main_process(config.rank) and all_predictions:
+        # For multi-label: use 'samples' average which computes metrics for each sample
+        # and returns the average
         precision, recall, f1, _ = precision_recall_fscore_support(
-            all_labels, all_predictions, average='weighted', zero_division=0
+            all_labels, all_predictions, average='samples', zero_division=0
         )
     else:
         precision, recall, f1 = 0.0, 0.0, 0.0
@@ -690,41 +669,32 @@ def train_model() -> None:
     texts, labels = load_data(config)
     tokenizer = create_tokenizer(config.model_name)
 
-    # Check for separate validation file
-    val_data = load_validation_data(config)
+    # Always split training data for validation (20% by default)
+    total_size = len(texts)
+    train_size = int((1 - config.val_split) * total_size)
 
-    if val_data is not None:
-        # Use separate validation file
-        train_texts, train_labels = texts, labels
-        val_texts, val_labels = val_data
-        logging.info("Using separate validation file")
-    else:
-        # Split training data for validation
-        total_size = len(texts)
-        train_size = int((1 - config.val_split) * total_size)
+    # Set random seed for reproducibility
+    np.random.seed(config.seed)
+    indices = np.arange(total_size)
+    np.random.shuffle(indices)
 
-        indices = np.arange(total_size)
-        np.random.shuffle(indices)
+    train_texts = [texts[i] for i in indices[:train_size]]
+    train_labels = labels[indices[:train_size]]
+    val_texts = [texts[i] for i in indices[train_size:]]
+    val_labels = labels[indices[train_size:]]
 
-        train_texts = [texts[i] for i in indices[:train_size]]
-        train_labels = labels[indices[:train_size]]
-        val_texts = [texts[i] for i in indices[train_size:]]
-        val_labels = labels[indices[train_size:]]
-
-        if is_main_process(config.rank):
-            logging.info(
-                f"Split data: {len(train_texts)} train, {len(val_texts)} validation"
-            )
+    if is_main_process(config.rank):
+        logging.info(f"Split training data: {len(train_texts)} train ({(1-config.val_split)*100:.0f}%), {len(val_texts)} validation ({config.val_split*100:.0f}%)")
 
     # Create data loaders
     train_loader = create_data_loader(
         train_texts, train_labels, tokenizer,
-        config.max_length, config.batch_size,
+        config.max_length, config.batch_size, config.num_classes,
         shuffle=True, distributed=config.distributed
     )
     val_loader = create_data_loader(
         val_texts, val_labels, tokenizer,
-        config.max_length, config.batch_size,
+        config.max_length, config.batch_size, config.num_classes,
         shuffle=False, distributed=config.distributed
     )
 
@@ -768,8 +738,8 @@ def train_model() -> None:
         num_training_steps=total_steps
     )
 
-    # Loss function
-    criterion = nn.CrossEntropyLoss()
+    # Loss function - BCEWithLogitsLoss for multi-label classification
+    criterion = nn.BCEWithLogitsLoss()
 
     # Create metrics trackers
     train_metrics = DistributedMetrics(config.world_size)

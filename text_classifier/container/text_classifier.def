@@ -7,7 +7,6 @@ From: pytorch/pytorch:2.6.0-cuda12.4-cudnn9-runtime
     Features:
     - Multi-GPU distributed training using torchrun
     - BERT encoder with classification head
-    - Optimized for NVIDIA H100 GPUs
     - Memory-efficient training with autocast
     - Comprehensive logging and checkpointing
 
@@ -29,7 +28,7 @@ From: pytorch/pytorch:2.6.0-cuda12.4-cudnn9-runtime
     pyproject.toml /app/pyproject.toml
     src/* /app/src/
     data/ /app/data/
-    apptainer.env /app/.env
+    sherlock.env /app/.env
 
 %post
     # Update and install system dependencies
@@ -49,7 +48,6 @@ From: pytorch/pytorch:2.6.0-cuda12.4-cudnn9-runtime
 
     # Install Python dependencies
     uv sync
-    uv pip install python-dotenv pyarrow
 
     # Create necessary directories
     mkdir -p checkpoints logs data
@@ -60,7 +58,7 @@ From: pytorch/pytorch:2.6.0-cuda12.4-cudnn9-runtime
 %environment
     # Python environment
     export PYTHONPATH=/app:$PYTHONPATH
-    export DEPLOYMENT_ENV=sherlock
+    export DEPLOYMENT_ENV=local
 
     # NCCL settings for optimized distributed training
     export NCCL_SOCKET_IFNAME=lo

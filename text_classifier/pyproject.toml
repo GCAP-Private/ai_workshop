@@ -5,7 +5,7 @@ description = "BERT-based text classifier using PyTorch"
 authors = [
     {name = "Max Feng", email = "xwfeng@stanford.edu"}
 ]
-requires-python = ">=3.9"
+requires-python = ">=3.11"
 dependencies = [
     "torch>=1.9.0",
     "transformers>=4.20.0",
@@ -13,6 +13,8 @@ dependencies = [
     "numpy>=1.21.0",
     "scikit-learn>=1.0.0",
     "tqdm>=4.62.0",
+    "pyarrow>=21.0",
+    "python-dotenv>=1.1",
 ]
 
 [project.optional-dependencies]
@@ -30,7 +32,7 @@ build-backend = "setuptools.build_meta"
 
 [tool.black]
 line-length = 88
-target-version = ['py39']
+target-version = ['py311']
 include = '\.pyi?$'
 
 [tool.isort]
@@ -39,7 +41,7 @@ multi_line_output = 3
 line_length = 88
 
 [tool.mypy]
-python_version = "3.9"
+python_version = "3.11"
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = true

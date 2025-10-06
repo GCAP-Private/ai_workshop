@@ -67,7 +67,17 @@ class TextClassifierInference:
         print(f"Number of classes: {self.model_config.num_classes}")
         print(f"Label map: {self.label_map}")
 
-    def predict_single(self, text: str) -> Dict[str, Union[str, float, List[float]]]:
+    def predict_single(self, text: str, threshold: float = 0.5) -> Dict[str, Union[str, List, float]]:
+        """
+        Predict labels for a single text (multi-label classification).
+
+        Args:
+            text: Input text to classify
+            threshold: Probability threshold for positive class (default: 0.5)
+
+        Returns:
+            Dictionary with predicted classes, labels, and probabilities
+        """
         encoding = self.tokenizer(
             text,
             truncation=True,
@@ -81,16 +91,23 @@ class TextClassifierInference:
 
         with torch.no_grad():
             outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
-            probabilities = F.softmax(outputs, dim=1)
-            predicted_class = torch.argmax(probabilities, dim=1).item()
-            confidence = probabilities[0][predicted_class].item()
+            # For multi-label classification, apply sigmoid to get probabilities
+            probabilities = torch.sigmoid(outputs)
+            # Get predicted classes where probability > threshold
+            # Model outputs 7 values (one per category)
+            predicted_indices = (probabilities[0] > threshold).nonzero(as_tuple=True)[0].cpu().numpy().tolist()
+
+            # Map indices to category names
+            category_names = ['antitrust', 'civil_rights', 'crime', 'govt_regulation',
+                            'labor_movement', 'politics', 'protests']
+            predicted_labels = [category_names[idx] for idx in predicted_indices]
 
         return {
             'text': text,
-            'predicted_class': predicted_class,
-            'predicted_label': self.label_map.get(predicted_class, f"class_{predicted_class}"),
-            'confidence': confidence,
-            'probabilities': probabilities[0].cpu().numpy().tolist()
+            'predicted_indices': predicted_indices,
+            'predicted_labels': predicted_labels,
+            'probabilities': probabilities[0].cpu().numpy().tolist(),
+            'threshold': threshold
         }
 
     def predict_batch(self, texts: List[str], batch_size: int = 16) -> List[Dict[str, Union[str, float, List[float]]]]:
@@ -121,10 +138,10 @@ class TextClassifierInference:
         print(f"Processing {len(texts)} texts from {input_file}")
         results = self.predict_batch(texts)
 
-        # Add predictions to dataframe
-        df['predicted_class'] = [r['predicted_class'] for r in results]
-        df['predicted_label'] = [r['predicted_label'] for r in results]
-        df['confidence'] = [r['confidence'] for r in results]
+        # Add predictions to dataframe (multi-label format)
+        df['predicted_indices'] = [r['predicted_indices'] for r in results]
+        df['predicted_labels'] = [r['predicted_labels'] for r in results]
+        df['probabilities'] = [r['probabilities'] for r in results]
 
         # Save results
         if output_file:
@@ -166,20 +183,18 @@ class TextClassifierInference:
 
         texts = df[text_column].astype(str).tolist()
 
-        # Handle labels - convert to int64, handling various formats
+        # Handle labels - already in one-hot encoded format (7-dimensional arrays)
         label_series = df[label_column]
-        if isinstance(label_series.iloc[0], (list, np.ndarray)):
-            true_labels = np.array([int(label[0]) for label in label_series], dtype=np.int64)
-        else:
-            true_labels = label_series.astype(np.int64).to_numpy()
+        # Labels are already one-hot encoded
+        true_labels = np.array([np.array(label, dtype=np.float32) for label in label_series])
 
         print(f"\nEvaluating on {len(texts)} test samples...")
-        print(f"Label distribution: {np.bincount(true_labels)}")
+        print(f"Label shape: {true_labels.shape}")
 
         # Create test dataloader for efficient batch processing
         labels_list = true_labels.tolist()
         dataset = TextClassificationDataset(
-            texts, labels_list, self.tokenizer, self.model_config.max_length
+            texts, labels_list, self.tokenizer, self.model_config.max_length, self.model_config.num_classes
         )
 
         test_loader = DataLoader(
@@ -196,7 +211,7 @@ class TextClassifierInference:
         all_predictions = []
         all_true_labels = []
         total_loss = 0.0
-        criterion = torch.nn.CrossEntropyLoss()
+        criterion = torch.nn.BCEWithLogitsLoss()
 
         with torch.no_grad():
             for batch in test_loader:
@@ -208,8 +223,8 @@ class TextClassifierInference:
                 outputs = self.model(input_ids=input_ids, attention_mask=attention_mask)
                 loss = criterion(outputs, labels)
 
-                # Get predictions
-                predictions = torch.argmax(outputs, dim=1)
+                # Get predictions for multi-label classification
+                predictions = (torch.sigmoid(outputs) > 0.5).float()
 
                 # Accumulate results
                 total_loss += loss.item() * input_ids.size(0)
@@ -220,50 +235,44 @@ class TextClassifierInference:
         true_labels = np.array(all_true_labels)
         avg_loss = total_loss / len(dataset)
 
-        # Compute metrics
-        average = 'binary' if self.model_config.num_classes == 2 else 'macro'
-
+        # Compute metrics for multi-label classification
+        # Use 'samples' average which computes metrics for each sample
         metrics = {
             'test_loss': avg_loss,
-            'accuracy': accuracy_score(true_labels, predictions),
-            'precision': precision_score(true_labels, predictions, average=average, zero_division=0),
-            'recall': recall_score(true_labels, predictions, average=average, zero_division=0),
-            'f1_score': f1_score(true_labels, predictions, average=average, zero_division=0),
+            'exact_match_accuracy': accuracy_score(true_labels, predictions),
+            'precision': precision_score(true_labels, predictions, average='samples', zero_division=0),
+            'recall': recall_score(true_labels, predictions, average='samples', zero_division=0),
+            'f1_score': f1_score(true_labels, predictions, average='samples', zero_division=0),
         }
 
         # Print results
         print("\n" + "="*70)
         print("TEST RESULTS")
         print("="*70)
-        print(f"Test Loss:      {metrics['test_loss']:.4f}")
-        print(f"Accuracy:       {metrics['accuracy']:.4f}")
-        print(f"Precision:      {metrics['precision']:.4f}")
-        print(f"Recall:         {metrics['recall']:.4f}")
-        print(f"F1 Score:       {metrics['f1_score']:.4f}")
+        print(f"Test Loss:              {metrics['test_loss']:.4f}")
+        print(f"Exact Match Accuracy:   {metrics['exact_match_accuracy']:.4f}")
+        print(f"Precision (samples):    {metrics['precision']:.4f}")
+        print(f"Recall (samples):       {metrics['recall']:.4f}")
+        print(f"F1 Score (samples):     {metrics['f1_score']:.4f}")
 
-        # Per-class metrics
-        print("\nPer-Class Metrics:")
+        # Per-class metrics for multi-label classification
+        print("\nPer-Class Metrics (binary for each label):")
         print("-"*70)
-        class_names = [f"Class {i}" for i in range(self.model_config.num_classes)]
-        report = classification_report(
-            true_labels, predictions, target_names=class_names, zero_division=0
-        )
-        print(report)
+        category_names = ['antitrust', 'civil_rights', 'crime', 'govt_regulation',
+                         'labor_movement', 'politics', 'protests']
 
-        # Confusion matrix
-        print("\nConfusion Matrix:")
-        print("-"*70)
-        cm = confusion_matrix(true_labels, predictions)
-
-        # Print header
-        header = "True\\Pred  " + "  ".join([f"Class {i:2d}" for i in range(self.model_config.num_classes)])
-        print(header)
-        print("-" * len(header))
-
-        # Print matrix rows
         for i in range(self.model_config.num_classes):
-            row = f"Class {i:2d}   " + "  ".join([f"{cm[i, j]:8d}" for j in range(self.model_config.num_classes)])
-            print(row)
+            class_true = true_labels[:, i]
+            class_pred = predictions[:, i]
+
+            # Compute metrics for this class
+            class_precision = precision_score(class_true, class_pred, zero_division=0)
+            class_recall = recall_score(class_true, class_pred, zero_division=0)
+            class_f1 = f1_score(class_true, class_pred, zero_division=0)
+            support = int(class_true.sum())
+
+            class_name = category_names[i]
+            print(f"{class_name:20s} - Precision: {class_precision:.4f}, Recall: {class_recall:.4f}, F1: {class_f1:.4f}, Support: {support}")
 
         print("="*70)
 

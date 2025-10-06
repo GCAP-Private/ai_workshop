@@ -17,14 +17,15 @@ from config import Config
 
 class BERTClassifier(nn.Module):
     """
-    BERT-based text classifier with CNN feature extraction.
+    BERT-based multi-label text classifier with CNN feature extraction.
 
     Architecture:
         BERT → Conv1D → MaxPooling → BatchNorm → Dense → Classifier
 
     Uses a pretrained BERT model followed by CNN layers for feature extraction
-    and a classification head. Supports any AutoModel-compatible pretrained model
-    from HuggingFace.
+    and a classification head. Supports multi-label classification where each
+    sample can belong to multiple classes simultaneously. Use with BCEWithLogitsLoss
+    for training.
 
     Args:
         config: Config instance containing model hyperparameters
@@ -37,7 +38,7 @@ class BERTClassifier(nn.Module):
         batch_norm: Batch normalization layer
         dropout: Dropout layer for regularization
         dense: Dense hidden layer
-        classifier: Linear classification head
+        classifier: Linear classification head (outputs logits for each class)
     """
 
     def __init__(self, config: Config) -> None:
@@ -55,8 +56,8 @@ class BERTClassifier(nn.Module):
         self.conv1d = nn.Conv1d(
             in_channels=config.hidden_size,
             out_channels=256,
-            kernel_size=3,
-            padding=1
+            kernel_size=5,
+            padding=3
         )
         self.maxpool = nn.AdaptiveMaxPool1d(1)
         # Use track_running_stats=True but handle batch_size=1 in forward pass
@@ -98,7 +99,7 @@ class BERTClassifier(nn.Module):
             token_type_ids: Token type IDs of shape (batch_size, seq_length)
 
         Returns:
-            Logits of shape (batch_size, num_classes)
+            Logits of shape (batch_size, num_classes) for multi-label classification
         """
         # Get BERT outputs
         outputs = self.bert(
@@ -154,34 +155,38 @@ class BERTClassifier(nn.Module):
 
 class TextClassificationDataset(torch.utils.data.Dataset):
     """
-    PyTorch Dataset for text classification.
+    PyTorch Dataset for multi-label text classification.
 
     Handles tokenization and encoding of text data for model training/inference.
 
     Args:
         texts: List of text strings
-        labels: List of integer labels (optional for inference)
+        labels: List of label arrays/lists where each element is an array of class indices (optional for inference)
         tokenizer: HuggingFace tokenizer instance
         max_length: Maximum sequence length for tokenization
+        num_classes: Number of classes for multi-label classification
 
     Attributes:
         texts: Stored text data
         labels: Stored label data
         tokenizer: Tokenizer instance
         max_length: Maximum sequence length
+        num_classes: Number of classes
     """
 
     def __init__(
         self,
         texts: List[str],
-        labels: Optional[List[int]],
+        labels: Optional[List[List[int]]],
         tokenizer: PreTrainedTokenizer,
-        max_length: int
+        max_length: int,
+        num_classes: int
     ) -> None:
         self.texts = texts
         self.labels = labels
         self.tokenizer = tokenizer
         self.max_length = max_length
+        self.num_classes = num_classes
 
         # Validate inputs
         if labels is not None and len(texts) != len(labels):
@@ -220,9 +225,17 @@ class TextClassificationDataset(torch.utils.data.Dataset):
             'attention_mask': encoding['attention_mask'].flatten(),
         }
 
-        # Add label if available
+        # Add label if available - labels are already one-hot encoded
         if self.labels is not None:
-            item['label'] = torch.tensor(self.labels[idx], dtype=torch.long)
+            # Labels are already in one-hot format (7-dimensional arrays)
+            label_array = self.labels[idx]
+            # Convert to tensor
+            if isinstance(label_array, (list, tuple)):
+                label_vector = torch.tensor(label_array, dtype=torch.float32)
+            else:
+                label_vector = torch.from_numpy(label_array).float()
+
+            item['label'] = label_vector
 
         return item
 
